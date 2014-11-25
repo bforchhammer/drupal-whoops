@@ -6,94 +6,130 @@
 
 namespace Drupal\whoops;
 
-use Drupal\Core\ContentNegotiation;
+use Drupal\Core\EventSubscriber\DefaultExceptionSubscriber;
+use Drupal\Core\Utility\Error;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\GetResponseEvent;
 use Symfony\Component\HttpKernel\Event\GetResponseForExceptionEvent;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
+use Whoops\Handler\JsonResponseHandler;
+use Whoops\Handler\PlainTextHandler;
+use Whoops\Handler\PrettyPageHandler;
+use Whoops\Run as WhoopsRuntime;
 
-class EventSubscriber implements EventSubscriberInterface {
-  /**
-   * @var \Whoops\Run
-   */
-  private $whoops;
+class EventSubscriber extends DefaultExceptionSubscriber implements EventSubscriberInterface {
+  /** @var PrettyPageHandler */
+  protected $htmlHandler;
+  /** @var JsonResponseHandler */
+  protected $ajaxHandler;
+  /** @var WhoopsRuntime */
+  protected $whoops;
 
   /**
    * {@inheritdoc}
    */
   public static function getSubscribedEvents() {
     $events[KernelEvents::REQUEST][] = array('registerWhoops', 500);
-    $events[KernelEvents::EXCEPTION][] = array('onException', 500);
+    $events[KernelEvents::EXCEPTION][] = array('onException');
     return $events;
   }
 
-  public function registerWhoops(GetResponseEvent $event) {
-    $this->whoops = new \Whoops\Run();
-    $this->whoops->silenceErrorsInPaths('/.*/', E_NOTICE);
-    $this->whoops->register();
-  }
-
   /**
-   * Handles errors for this subscriber.
-   *
-   * @param \Symfony\Component\HttpKernel\Event\GetResponseForExceptionEvent $event
-   *   The event to process.
+   * @param GetResponseForExceptionEvent $event
    */
   public function onException(GetResponseForExceptionEvent $event) {
-    $format = $this->getFormat($event->getRequest());
-
-    switch ($format) {
-      case 'json':
-        $this->whoops->pushHandler(new \Whoops\Handler\JsonResponseHandler);
-        break;
-      case 'html':
-      default:
-        $this->whoops->pushHandler(new \Whoops\Handler\PrettyPageHandler());
-        break;
-    }
-    $output = $this->whoops->handleException($event->getException());
-    $event->setResponse(new Response($output));
+    // Leave proper response handling to Drupal.
+    $this->whoops->sendHttpCode(FALSE);
+    parent::onException($event);
   }
 
   /**
-   * Gets the error-relevant format from the request.
+   * Creates an instance of the Whoops runtime, and registers handlers for
+   * catching fatal errors, which are not caught by Drupal core. Other
+   * exceptions are handled via the EXCEPTION kernel event, errors are left to
+   * be handled by core (i.e. usually printed out in the message area).
    *
-   * @param \Symfony\Component\HttpFoundation\Request $request
-   *   The request object.
-   *
-   * @return string
-   *   The format as which to treat the exception.
+   * @param GetResponseEvent $event
    */
-  protected function getFormat(Request $request) {
-    // @todo We are trying to switch to a more robust content negotiation
-    // library in https://www.drupal.org/node/1505080 that will make
-    // $request->getRequestFormat() reliable as a better alternative
-    // to this code. We therefore use this style for now on the expectation
-    // that it will get replaced with better code later. This approach makes
-    // that change easier when we get to it.
-    $conneg = new ContentNegotiation();
-    $format = $conneg->getContentType($request);
+  public function registerWhoops(GetResponseEvent $event) {
+    $this->whoops = new WhoopsRuntime();
 
-    // These are all JSON errors for our purposes. Any special handling for
-    // them can/should happen in earlier listeners if desired.
-    if (in_array($format, ['drupal_modal', 'drupal_dialog', 'drupal_ajax'])) {
-      $format = 'json';
+    // Disable xdebug stack traces, ours are way better! :) Also, xdebug
+    // stacktraces don't work well with JSON responses.
+    if (function_exists('xdebug_disable')) {
+      xdebug_disable();
     }
 
-    // Make an educated guess that any Accept header type that includes "json"
-    // can probably handle a generic JSON response for errors. As above, for
-    // any format this doesn't catch or that wants custom handling should
-    // register its own exception listener.
-    foreach ($request->getAcceptableContentTypes() as $mime) {
-      if (strpos($mime, 'html') === FALSE && strpos($mime, 'json') !== FALSE) {
-        $format = 'json';
-      }
-    }
+    // Let whoops only handled fatal errors directly.
+    register_shutdown_function(array(
+      $this->whoops,
+      WhoopsRuntime::SHUTDOWN_HANDLER
+    ));
 
-    return $format;
+    if (PHP_SAPI === 'cli') {
+      $this->whoops->pushHandler(new PlainTextHandler());
+    }
+    else {
+      // Register default handlers for pretty HTML and JSON.
+      $this->htmlHandler = new PrettyPageHandler();
+      $this->whoops->pushHandler($this->htmlHandler);
+
+      $this->ajaxHandler = new JsonResponseHandler();
+      $this->ajaxHandler->addTraceToOutput(TRUE);
+      $this->ajaxHandler->onlyForAjaxRequests(TRUE);
+      $this->whoops->pushHandler($this->ajaxHandler);
+    }
   }
 
+  /**
+   * @param GetResponseForExceptionEvent $event
+   */
+  protected function onJson(GetResponseForExceptionEvent $event) {
+    $exception = $event->getException();
+    $error = Error::decodeException($exception);
+
+    // Display the message if the current error reporting level allows this type
+    // of message to be displayed,
+    $data = NULL;
+    if (error_displayable($error)) {
+      // We have already determined that we need a JSON response.
+      $this->ajaxHandler->onlyForAjaxRequests(FALSE);
+      // Get output and json_decode() it for the JsonResponse below.
+      $data = json_decode($this->whoops->handleException($exception));
+    }
+
+    $response = new JsonResponse($data, Response::HTTP_INTERNAL_SERVER_ERROR);
+    if ($exception instanceof HttpExceptionInterface) {
+      $response->setStatusCode($exception->getStatusCode());
+    }
+
+    $event->setResponse($response);
+  }
+
+  /**
+   * @param GetResponseForExceptionEvent $event
+   */
+  protected function onHtml(GetResponseForExceptionEvent $event) {
+    $exception = $event->getException();
+    $error = Error::decodeException($exception);
+
+    // Display the message if the current error reporting level allows this type
+    // of message to be displayed, and unconditionally in update.php.
+    if (error_displayable($error)) {
+      $output = $this->whoops->handleException($event->getException());
+      $response = new Response($output);
+      if ($exception instanceof HttpExceptionInterface) {
+        $response->setStatusCode($exception->getStatusCode());
+      }
+      else {
+        $response->setStatusCode(Response::HTTP_INTERNAL_SERVER_ERROR, '500 Service unavailable (with message)');
+      }
+      $event->setResponse($response);
+    }
+  }
 
 }
