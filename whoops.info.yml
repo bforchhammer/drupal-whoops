@@ -1,0 +1,4 @@
+name: Whoops
+type: module
+description: PHP errors for cool kids.
+core: 8.x
